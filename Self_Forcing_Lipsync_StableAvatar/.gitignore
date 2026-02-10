@@ -1,0 +1,16 @@
+*egg-info*
+examples/wanvideo/model_training/.venv
+examples/wanvideo/model_training/output
+*__pycache__*
+*.log
+*.safetensors
+*.pt
+*.gif
+examples/wanvideo/model_training/diffusion_loss/
+examples/wanvideo/model_training/models/
+wandb/
+*.sh
+*.csv
+*.mp4
+.venv/
+examples/wanvideo/model_training/checkpoints/

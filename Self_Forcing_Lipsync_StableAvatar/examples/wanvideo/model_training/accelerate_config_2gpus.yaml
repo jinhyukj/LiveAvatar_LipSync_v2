@@ -1,0 +1,6 @@
+# Since this is single GPU/XPU, we don't need distributed training
+distributed_type: "MULTI_GPU"
+# Can be one of "no", "fp16", or "bf16" (see `transformer_engine.yaml` for `fp8`)
+mixed_precision: "bf16"
+
+num_processes: 2

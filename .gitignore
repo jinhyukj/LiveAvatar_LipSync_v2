@@ -1,0 +1,118 @@
+# Model weights and checkpoints
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.h5
+*.bin
+*.pkl
+*.model
+checkpoint*/
+checkpoints/
+pretrained/
+ckpt/
+
+# Training data and outputs
+random30_subset/
+metadata_from_nipa/
+output/
+outputs/
+
+# Large media / archives
+*.mp4
+*.gif
+*.zip
+*.tar.gz
+*.npz
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+venv.bak/
+env.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+*.so
+diffsynth.egg-info/
+.installed.cfg
+MANIFEST
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+# Experiment tracking
+wandb/
+timing_logs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# Byte-compiled
+*.pyc
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Misc
+*.log
+*.ttf
+*.pb
+.env
+tmp/
+ignored_cache
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+
+# Project-specific (LiveAvatar)
+wan_models/
+diffusers/
+third_party/
+grounded_dino_ckpts/
+
+# Project-specific (Self-Forcing)
+Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/.venv
+Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/checkpoints/
+Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/models/
+Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/random30_subset/
+Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_from_nipa/

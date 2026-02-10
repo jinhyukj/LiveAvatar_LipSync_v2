@@ -1,0 +1,92 @@
+# 训练设置
+num_frames: 48 #max_num_frames也要改,liveavatar/models/wan/wan_2_2/configs/wan_s2v_14B_modified.py 也要改
+max_steps: 100000
+val_check_interval: 250
+i2v: True   # ti2v
+use_audio: True  # tia2v
+drop_audio: 0.15
+drop_motion_frames: 0
+drop_part_motion_frames: 0
+add_noise_to_motion: 
+beta_a: 0.93
+beta_b: 3.79
+motion_noise_type: "std_scale" # [std_scale, beta_noise]
+debug: false
+sp_size: 1
+infer: False
+infer_steps: 20
+reset: False
+load_from: 
+valid_scale_guidance: 5
+use_captionemb: True
+strategy: 'deepspeed' # deepspeed fsdp # TODO: fsdp 在sp_size>1时会卡住
+
+# 数据路径
+dataset_path: [
+
+]
+dataset_weights: [0.5, 50]
+val_list: [0, 10, 100, 1000, 10000, 20000, 30000, 40000, 50000, 100000]
+
+dataset_mix_wh: False
+dataset:
+  max_num_frames: 121 #等于num_frames+motion_frames[0]即 num_frames+73,s2v config 也要改
+  meta_name: v1_3_s2v_720_fine #v3_a2v_720
+  dataset_max_token: 80000  # exrtact lat max token
+  max_token: 60000  # max token for training
+  max_wh: 720
+  frame_interval: 1
+  skip_frms_num: 3 # 似乎不起作用
+  audio: True
+  enable_audio_augment: True
+  caption_mode: tarsier # [qwen-vl, tarsier]
+
+# 预训练模型路径
+ckpt_dir: ./Wan2.2-S2V-14B/ 
+wav2vec_path: ./Wan2.2-S2V-14B/ 
+
+
+# 训练参数
+dataloader_num_workers: 0  # 大于0会导致内存泄露的问题，暂时未找到原因，怀疑是sampler在不断的塞数据
+learning_rate: 5.0e-5
+audio_learning_rate: 1.0e-5
+accumulate_grad_batches: 1
+
+# 模型参数更新
+model_config:
+
+
+# LoRA 参数
+lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
+init_lora_weights: "kaiming"
+lora_rank: 128
+lora_alpha: 64.0
+
+# 训练优化
+use_gradient_checkpointing: true
+use_gradient_checkpointing_offload: false
+t5_cpu: true
+convert_model_dtype: true
+train_architecture: lora
+pretrained_lora_path:
+use_s2v_fsdp: false
+
+deepspeed_config:
+  zero_optimization:
+    stage: 2
+    overlap_comm: False
+    contiguous_gradients: True
+    reduce_bucket_size: 50000000
+    stage3_param_persistence_threshold: 100000
+    gather_16bit_weights_on_model_save: True
+  bf16: 
+    enabled: True
+  train_micro_batch_size_per_gpu: 1
+  steps_per_print: 50
+  wall_clock_breakdown: False
+  zero_allow_untested_optimizer: True
+
+
+# 训练日志
+use_swanlab: true
+swanlab_mode: "cloud"
