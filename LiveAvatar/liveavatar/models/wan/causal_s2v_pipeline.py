@@ -690,6 +690,7 @@ class WanS2V:
         mask=None,
         input_video_for_sam2=None,
         enable_online_decode=False,
+        profile=False,
     ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -738,6 +739,16 @@ class WanS2V:
                 - W: Frame width from max_area)
         """
         # ------------------------------------Step 1: prepare conditional inputs--------------------------------------
+
+        # Initialize profiling if enabled
+        if profile:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            total_start = torch.cuda.Event(enable_timing=True)
+            setup_end = torch.cuda.Event(enable_timing=True)
+            total_diffusion_ms = 0.0
+            total_vae_decode_ms = 0.0
+            total_start.record()
 
         size = self.get_gen_size(
             size=None,
@@ -924,6 +935,9 @@ class WanS2V:
         else:
             raise NotImplementedError("Unsupported solver.")
 
+        # Mark end of setup phase for profiling
+        if profile:
+            setup_end.record()
 
         #--------------------------------------Step 2: generate--------------------------------------
         with (
@@ -1046,6 +1060,12 @@ class WanS2V:
 
                 num_blocks = target_shape[0] // self.num_frames_per_block
                 for block_index in range(num_blocks):
+                    # Start block timing for profiling
+                    if profile:
+                        block_start = torch.cuda.Event(enable_timing=True)
+                        block_end = torch.cuda.Event(enable_timing=True)
+                        block_start.record()
+
                     # 2.2.1 prepare block-level cond
                     if getattr(self, '_sampler_timesteps', None) is None:
                         sample_scheduler.set_timesteps(
@@ -1101,9 +1121,20 @@ class WanS2V:
                     clip_output[:, block_index * self.num_frames_per_block:(
                         block_index + 1) * self.num_frames_per_block] = block_latents #[16,num_frames_per_block,h,w]
 
+                    # End block timing and accumulate for profiling
+                    if profile:
+                        block_end.record()
+                        torch.cuda.synchronize()
+                        total_diffusion_ms += block_start.elapsed_time(block_end)
 
                 #----------------------------------------------Step 2.3: clip-level postprocess---------------------------------
                 if r == 0 and enable_online_decode:
+                    # Start VAE decode timing for profiling
+                    if profile:
+                        vae_start = torch.cuda.Event(enable_timing=True)
+                        vae_end = torch.cuda.Event(enable_timing=True)
+                        vae_start.record()
+
                     if offload_model:
                         print(f"offloading model to cpu, please wait...")
                         self.noise_model.cpu()
@@ -1138,6 +1169,12 @@ class WanS2V:
                         self.noise_model.to(self.device)
                         torch.cuda.synchronize()
                         torch.cuda.empty_cache()
+
+                    # End VAE decode timing and accumulate for profiling
+                    if profile:
+                        vae_end.record()
+                        torch.cuda.synchronize()
+                        total_vae_decode_ms += vae_start.elapsed_time(vae_end)
                 else:
                     clip_outputs.append(clip_output.detach().cpu())
 
@@ -1153,6 +1190,12 @@ class WanS2V:
                 self.vae.model.to(self.device)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+
+            # Start VAE decode timing for final batch
+            if profile:
+                vae_start = torch.cuda.Event(enable_timing=True)
+                vae_end = torch.cuda.Event(enable_timing=True)
+                vae_start.record()
 
             motion_latents_pp = motion_latents
             for clip_idx, clip_output_cpu in enumerate(clip_outputs):
@@ -1185,6 +1228,12 @@ class WanS2V:
                 ).type_as(clip_output)
                 out.append(image.cpu())
 
+            # End VAE decode timing and accumulate for profiling
+            if profile:
+                vae_end.record()
+                torch.cuda.synchronize()
+                total_vae_decode_ms += vae_start.elapsed_time(vae_end)
+
         videos = torch.cat(out, dim=2)
         del clip_noise, clip_latents, clip_output, block_latents
         self._sampler_timesteps = None
@@ -1199,6 +1248,31 @@ class WanS2V:
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+        # Return profiling results if enabled
+        if profile:
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_end.record()
+            torch.cuda.synchronize()
+
+            timing = {
+                "total_ms": total_start.elapsed_time(total_end),
+                "setup_ms": total_start.elapsed_time(setup_end),
+                "diffusion_ms": total_diffusion_ms,
+                "vae_decode_ms": total_vae_decode_ms,
+                "num_clips": active_nr,
+                "num_frames": videos.shape[2] if videos is not None else 0,
+                "peak_gpu_memory_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
+            }
+            if timing["total_ms"] > 0:
+                timing["fps_total"] = timing["num_frames"] / (timing["total_ms"] / 1000)
+            else:
+                timing["fps_total"] = 0.0
+
+            if self.rank == 0:
+                return (videos[0], timing), dataset_info
+            else:
+                return (None, timing), dataset_info
 
         return videos[0] if self.rank == 0 else None, dataset_info
 

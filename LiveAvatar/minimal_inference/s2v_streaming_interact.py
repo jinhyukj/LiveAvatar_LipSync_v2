@@ -329,6 +329,11 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to enable fp8 quantization.")
+    parser.add_argument(
+        "--enable_profiling",
+        action="store_true",
+        default=False,
+        help="Enable detailed performance profiling with CUDA events")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -526,10 +531,30 @@ def generate(args, training_settings):
             enable_vae_parallel=args.enable_vae_parallel,
             input_video_for_sam2=None,
             enable_online_decode=args.enable_online_decode,
+            profile=args.enable_profiling,
         )
+
+        # Handle profiling results if enabled
+        if args.enable_profiling and isinstance(video, tuple):
+            video, timing = video
+            # Print formatted profiling summary
+            total_ms = timing["total_ms"]
+            print("\n" + "="*60)
+            print("LIVEAVATAR PROFILING SUMMARY")
+            print("="*60)
+            print(f"Total Generation Time:  {total_ms:>10.2f} ms")
+            print(f"Setup Time:             {timing['setup_ms']:>10.2f} ms ({100*timing['setup_ms']/total_ms:>5.1f}%)")
+            print(f"Diffusion Time:         {timing['diffusion_ms']:>10.2f} ms ({100*timing['diffusion_ms']/total_ms:>5.1f}%)")
+            print(f"VAE Decode Time:        {timing['vae_decode_ms']:>10.2f} ms ({100*timing['vae_decode_ms']/total_ms:>5.1f}%)")
+            print("-"*60)
+            print(f"Clips Generated:        {timing['num_clips']:>10d}")
+            print(f"Frames Generated:       {timing['num_frames']:>10d}")
+            print(f"FPS (Total):            {timing['fps_total']:>10.2f}")
+            print(f"Peak GPU Memory:        {timing['peak_gpu_memory_gb']:>10.2f} GB")
+            print("="*60 + "\n")
     else:
         assert False, "Only s2v is supported for now."
-    
+
 
     print(f"denoising video done")
     print(f"rank: {rank}")

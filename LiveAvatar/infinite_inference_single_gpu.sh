@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0
+CUDA_VISIBLE_DEVICES=3
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=OFF
 
@@ -24,5 +24,6 @@ CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun --nproc_per_node=1 --master_
      --sample_solver euler \
      --single_gpu \
      --ckpt_dir ckpt/Wan2.2-S2V-14B/ \
-     --fp8
+     --fp8 \
+     --enable_profiling
      
