@@ -1,11 +1,17 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import warnings
 
 import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+# Suppress PySoundFile/audioread warnings when loading audio from MP4 containers.
+# PySoundFile can't read MP4 — the audioread fallback (ffmpeg) works correctly.
+warnings.filterwarnings("ignore", message="PySoundFile failed")
+warnings.filterwarnings("ignore", message="librosa.core.audio.__audioread_load")
 
 
 def get_sample_indices(original_fps,

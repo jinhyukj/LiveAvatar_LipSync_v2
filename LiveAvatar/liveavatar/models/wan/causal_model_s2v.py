@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp  # Updated: torch.cuda.amp is deprecated
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -213,8 +213,8 @@ class CausalHead_S2V(Head):
         original_dtype = x.dtype
         batch_size,num_frames = x.shape[0],e.shape[0] // x.shape[0]
         frame_seqlen =x.shape[1] // num_frames
-        with amp.autocast(dtype=torch.float32):
-            
+        with amp.autocast("cuda", dtype=torch.float32):
+
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)#modulation:nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)  +[b*F,1,dim] ->[B*F,2,dim]->chunk->tuple(2)*[b*F,1,dim]
             x = (self.head( (self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) # unflatten后: [b,F,frame_seqlen,dim],    e[0]:[b*F,1,dim]->[b,F,1,dim],
                           * (1 + e[1].unflatten(dim=0, sizes=(batch_size,num_frames))) + e[0].unflatten(dim=0, sizes=(batch_size,num_frames))).flatten(1, 2)) ) #[b,L1,dim]
@@ -384,7 +384,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         e = e[0]  # [B, F, 6, 2, C]
         
         modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 5120]->[1, 1, 6, 1, 5120]
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast("cuda", dtype=torch.float32):
             e = (modulation + e).chunk(6, dim=2) # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
         assert e[0].dtype == torch.float32
 
@@ -414,7 +414,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         
         y = self.self_attn(norm_x.type_as(bf_dtype_tensor), seq_lens, grid_sizes, freqs, block_mask, kv_cache, current_start, current_end, sp_size,seg_idx,freqs_cond) # [b,l,dim]
 
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast("cuda", dtype=torch.float32):
             y = y * e[2]
             x = x + y
 
@@ -426,7 +426,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
             
             y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
 
-            with amp.autocast(dtype=torch.float32):
+            with amp.autocast("cuda", dtype=torch.float32):
                 y = y * e[5]
                 x = x + y
             return x
@@ -653,13 +653,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                       rollout_num_frames=0,
                       sequence_current_start=0):
         # inject the motion frames token to the hidden states
-        if self.enable_motioner:
+        if self.config.enable_motioner:
             assert False
             mot, mot_remb = self.process_motion_transformer_motioner(
                 motion_latents,
                 drop_motion_frames=drop_motion_frames,
                 add_last_motion=add_last_motion)
-        elif self.enable_framepack:
+        elif self.config.enable_framepack:
             mot, mot_remb, motion_rope_cache = self.process_motion_frame_pack(
                 motion_latents,
                 drop_motion_frames=drop_motion_frames,
@@ -947,7 +947,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
             e0 = self.time_projection(e).unflatten(
@@ -1151,7 +1151,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
             e0 = self.time_projection(e).unflatten(
@@ -1407,7 +1407,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)]) # [b,F]->[b+1,F],默认为 true
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()) # t:[b+1,F], output:[(b+1)*F,dim]
             e0 = self.time_projection(e).unflatten(

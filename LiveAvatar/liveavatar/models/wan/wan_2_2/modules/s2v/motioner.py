@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp  # Updated: torch.cuda.amp is deprecated
 import torch.nn as nn
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.utils import BaseOutput, is_torch_version
@@ -27,7 +27,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@amp.autocast(enabled=False)
+@amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -38,7 +38,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@amp.autocast(enabled=False)
+@amp.autocast("cuda", enabled=False)
 def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
 
@@ -509,7 +509,7 @@ class MotionerTransformers(nn.Module, PeftAdapterMixin):
             freqs = freqs.to(device)
 
         if self.trainable_token_pos_emb:
-            with amp.autocast(dtype=torch.float64):
+            with amp.autocast("cuda", dtype=torch.float64):
                 token_freqs = self.token_freqs.to(torch.float64)
                 token_freqs = token_freqs / token_freqs.norm(
                     dim=-1, keepdim=True)

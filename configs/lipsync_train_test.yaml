@@ -1,0 +1,74 @@
+# LiveAvatar LipSync Training — TEST CONFIG
+# Quick verification of training + validation pipeline
+# Usage: bash train_lipsync.sh configs/lipsync_train_test.yaml
+
+# Model paths (same as production)
+checkpoint_dir: "/home/work/.local/LiveAvatar_LipSync/LiveAvatar/ckpt/Wan2.2-S2V-14B"
+vae_checkpoint: "Wan2.1_VAE.pth"
+wav2vec_model: "wav2vec2-large-xlsr-53-english"
+t5_checkpoint: "models_t5_umt5-xxl-enc-bf16.pth"
+t5_tokenizer: "google/umt5-xxl"
+
+# DMD LoRA (distillation for 4-step inference)
+dmd_lora_path: "LiveAvatar/ckpt/LiveAvatar/liveavatar.safetensors"
+merge_dmd_lora: false   # false = continue training DMD LoRA; true = merge into base + fresh LoRA
+
+# Data (same as production)
+data_root: "/home/work/.local/combined_data/high_visual_quality"
+metadata_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_combined_latentsync_train_162plus.csv
+mask_path: "/home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/latentsync_utils/mask.png"
+num_workers: 2
+
+# Training — minimal for testing
+batch_size: 1
+gradient_accumulation: 2       # 2 micro-steps per optimizer step
+learning_rate: 5.0e-5
+weight_decay: 0.01
+num_epochs: 1                  # Single epoch
+max_grad_norm: 1.0
+mixed_precision: "bf16"
+
+# Video
+height: 512
+width: 512
+num_frames: 81
+
+# LoRA
+lora_rank: 128
+lora_alpha: 64.0
+lora_targets: "q,k,v,o,ffn.0,ffn.2"
+
+# Dropout
+text_dropout: 0.1
+audio_dropout: 0.1
+
+# Loss
+mouth_weight: 5.0
+timestep_loss_weight: false     # Self-Forcing Gaussian timestep weighting (disabled: uniform is standard for flow matching)
+
+# Logging & checkpointing
+output_dir: "outputs/lipsync_train_test"
+save_steps: 999999             # Don't save checkpoints during test
+log_steps: 1                   # Log every step for visibility
+
+# Validation — trigger early to test
+validate_before_training: true  # Run validation at step 0 (baseline)
+val_steps: 3                   # Validate after just 3 training steps
+val_recon_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_10.csv
+val_mixed_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_mixed.csv
+val_num_samples: 2             # Only 2 samples per mode (fast)
+val_output_dir: "val_outputs_test"
+
+# Wandb (optional)
+use_wandb: true
+wandb_project: "LiveAvatar-LipSync"
+wandb_entity: "paulhcho"
+wandb_run_name: test              # defaults to output_dir basename
+wandb_api_key: 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               # or set WANDB_API_KEY env var
+wandb_log_every: 1                # log metrics every N optimizer steps
+wandb_run_id: null                # set to resume into existing run
+
+# SyncNet metrics (optional, during validation)
+compute_sync_metrics: true
+syncnet_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/syncnet_v2.model"
+s3fd_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/sfd_face.pth"

@@ -222,5 +222,98 @@ examples/wanvideo/model_training/
 
 **Note:** Use single-line ffmpeg commands when running in parallel to avoid bash variable expansion issues in multiline commands.
 
+## Checkpoint Comparison Stitching (val_outputs/)
+
+Stitch validation outputs across training checkpoints for side-by-side visual comparison. Videos live in `val_outputs/` with subdirectories per checkpoint step.
+
+### Directory Layout
+```
+val_outputs/
+├── step_0/
+│   ├── recon/          # {video_id}_shot_001_000_gen.mp4 + _gt.mp4
+│   └── mixed/          # v{video_id}_shot_*_a{audio_id}_shot_*_gen.mp4
+├── step_500/
+│   ├── recon/
+│   └── mixed/
+├── step_2500/
+│   ├── recon/
+│   └── mixed/
+└── step_N_stitched/    # Output directory (created per target step)
+```
+
+### Video ID Reference
+The 5 validation video IDs (shortened → full hash):
+- `28397...` → `283979598869ec6d8c5cdbe66eb5ecb8`
+- `4452d...` → `4452d828f84c6a2b2dee9c7a81e6c102`
+- `4d5b0...` → `4d5b044b30051de4f0a6b2dc419ea9ca`
+- `59cdb...` → `59cdb196328a33d4c7b1248b916e5090`
+- `ecb35...` → `ecb359eb6753b3b64a027f66d912892e`
+
+### 1. Recon Stitching (GT | step_A gen | step_B gen)
+Compares ground truth against generated outputs at different training steps. 3-wide horizontal stitch.
+
+```bash
+# For each of the 5 video IDs:
+ffmpeg -y \
+    -i val_outputs/step_B/recon/{VIDEO_ID}_shot_001_000_gt.mp4 \
+    -i val_outputs/step_A/recon/{VIDEO_ID}_shot_001_000_gen.mp4 \
+    -i val_outputs/step_B/recon/{VIDEO_ID}_shot_001_000_gen.mp4 \
+    -filter_complex "[0:v][1:v][2:v]hstack=inputs=3[v]" \
+    -map "[v]" -map "0:a" \
+    -c:v libx264 -crf 18 -preset fast -c:a aac \
+    val_outputs/step_B_stitched/recon_{VIDEO_ID}.mp4
+```
+
+- GT is identical across steps; source from any step (convention: use step_B)
+- Audio comes from GT (leftmost, `-map "0:a"`)
+- Layout: **GT (left) | Earlier step (middle) | Later step (right)**
+
+### 2. Mixed Stitching (step_A gen | step_B gen)
+Compares cross-audio (face from one clip, audio from another) generations across steps. 2-wide stitch. No GT exists for cross-audio combinations.
+
+```bash
+# For each matching mixed video across step_A and step_B:
+ffmpeg -y \
+    -i val_outputs/step_A/mixed/{MIXED_FILENAME} \
+    -i val_outputs/step_B/mixed/{MIXED_FILENAME} \
+    -filter_complex "[0:v][1:v]hstack=inputs=2[v]" \
+    -map "[v]" -map "0:a" \
+    -c:v libx264 -crf 18 -preset fast -c:a aac \
+    val_outputs/step_B_stitched/mixed_{SHORT_NAME}.mp4
+```
+
+- Mixed filenames: `v{video_id}_shot_001_000_a{audio_id}_shot_001_000_gen.mp4`
+- Only stitch videos that exist in **both** step directories (intersection)
+- Audio from step_A (leftmost)
+- Short output names: `mixed_v{first5}_a{first5}.mp4` for readability
+
+### 3. Same-Identity Mixed-Audio Stitching
+Compares the same face identity driven by different audio sources at a single step. Useful for verifying lip-sync quality — mouth shapes should differ across panels while identity stays consistent.
+
+```bash
+# Group mixed videos by video_id prefix, stitch all audio variants:
+ffmpeg -y \
+    -i val_outputs/step_N/mixed/v{VID}_shot_*_a{AUDIO_1}_shot_*_gen.mp4 \
+    -i val_outputs/step_N/mixed/v{VID}_shot_*_a{AUDIO_2}_shot_*_gen.mp4 \
+    -i val_outputs/step_N/mixed/v{VID}_shot_*_a{AUDIO_3}_shot_*_gen.mp4 \
+    -filter_complex "[0:v][1:v][2:v]hstack=inputs=3[v]" \
+    -map "[v]" -map "0:a" \
+    -c:v libx264 -crf 18 -preset fast -c:a aac \
+    val_outputs/step_N_stitched/{VIDEO_ID}_mixed_audio.mp4
+```
+
+- Number of inputs varies by how many audio sources exist for that identity
+- Audio from leftmost panel (`-map "0:a"`)
+- Sort files alphabetically for consistent ordering across runs
+
+### Key Considerations
+- **Always use fully hardcoded paths** in ffmpeg commands (no bash variables) when running multiple commands in parallel — variable expansion can silently fail
+- **Audio sourcing**: Always `-map "0:a"` from the leftmost input. All videos in a stitch group share the same length
+- **Output naming**: Use shortened hashes for readability in mixed videos; full hashes for recon videos (since there's only 5)
+- **hstack requires same height** across all inputs — all val_outputs videos are the same resolution so this is safe
+
 # Points to follow:
 - Add under ## Working Style section\n\nListen carefully to what I say to ignore or keep. If I say 'ignore X' or 'keep Y', do not try to derive or modify those things. Re-read my instructions before proposing changes.
+- Never grep or search for files from ~/.local, as this takes forever. If you do not have a sense of where a file might be, ask. 
+- Before writing any code, give me a 5-line plan: which files you'll change, what you'll add/remove in each, and any assumptions. Wait for my approval before editing.
+- When asked to analyze in detail aspects of implementations in different repos, use a task agent.  In the main thread, summarize only the key points, and direct to the sub task for details. 
