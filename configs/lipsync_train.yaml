@@ -8,22 +8,25 @@ t5_checkpoint: "models_t5_umt5-xxl-enc-bf16.pth"
 t5_tokenizer: "google/umt5-xxl"
 
 # DMD LoRA (distillation for 4-step inference)
-dmd_lora_path: "LiveAvatar/ckpt/LiveAvatar/liveavatar.safetensors"
+dmd_lora_path: "/home/work/.local/LiveAvatar_LipSync/LiveAvatar/ckpt/LiveAvatar/liveavatar.safetensors"
 merge_dmd_lora: false   # false = continue training DMD LoRA; true = merge into base + fresh LoRA
 
 # Data
 data_root: "/home/work/.local/combined_data/high_visual_quality"
 metadata_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_combined_latentsync_train.csv  # Optional: CSV with "video" column for relative paths
-mask_path: "/home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/latentsync_utils/mask.png"  # Required: precomputed mouth mask image (H×W, white=keep/upper-face, black=inpaint/mouth)
+mask_path: "/home/work/.local/LiveAvatar_LipSync_v2/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/latentsync_utils/mask.png"  # Required for V2V: precomputed mouth mask image (H×W, white=keep/upper-face, black=inpaint/mouth)
 num_workers: 4
 
 # Pre-computation (set use_precomputed: true after running precompute scripts)
 use_precomputed: true
 precomputed_csv: "/home/work/liveavatar_data/metadata_precomputed.csv"
 
+# Training mode: "v2v" (49ch inpainting) or "i2v" (16ch noise-only, ref via sink)
+training_mode: "i2v"
+
 # Training
 batch_size: 1
-gradient_accumulation: 2     # Effective batch = 2 * num_gpus
+gradient_accumulation: 1     # Effective batch = 2 * num_gpus
 learning_rate: 5.0e-5
 weight_decay: 0.01
 num_epochs: 50
@@ -55,7 +58,7 @@ log_steps: 1
 
 # Validation
 validate_before_training: true  # Run validation at step 0 (baseline)
-val_steps: 500               # Run validation every N training steps
+val_steps: 50               # Run validation every N training steps
 val_recon_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_10.csv           # Path to recon validation CSV (columns: video, prompt)
 val_mixed_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_mixed.csv           # Path to mixed validation CSV (columns: video, audio_video, prompt)
 val_num_samples: 5            # Max samples per validation run
@@ -65,8 +68,8 @@ val_output_dir: "val_outputs" # Directory for validation output videos
 use_wandb: true
 wandb_project: "LiveAvatar-LipSync"
 wandb_entity: "paulhcho"
-wandb_run_name: "lipsync_train"              # defaults to output_dir basename
-wandb_api_key: "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"               # or set WANDB_API_KEY env var
+wandb_run_name: "lipsync_train_i2v"              # defaults to output_dir basename
+wandb_api_key: "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"               # or set WANDB_API_KEY env var
 wandb_log_every: 1                # log metrics every N optimizer steps
 wandb_run_id: null                # set to resume into existing run
 

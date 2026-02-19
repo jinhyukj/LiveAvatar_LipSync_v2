@@ -2,6 +2,10 @@
 # LiveAvatar LipSync Training Launch Script
 # Usage: bash train_lipsync.sh [CONFIG_PATH] [ACCELERATE_CONFIG]
 #
+# Training modes (set training_mode in config YAML):
+#   training_mode: "v2v"  — V2V inpainting (49ch: noise+mask+masked+ref)
+#   training_mode: "i2v"  — I2V generation (16ch noise only, ref via sink conditioning)
+#
 # Examples:
 #   bash train_lipsync.sh                                          # Single GPU, default config
 #   bash train_lipsync.sh configs/lipsync_train.yaml               # Single GPU, custom config

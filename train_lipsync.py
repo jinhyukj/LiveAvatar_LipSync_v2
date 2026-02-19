@@ -92,7 +92,11 @@ def move_vae(vae, device):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_and_prepare_model(config, device):
-    """Load pretrained CausalWanModel_S2V, expand to 49ch, apply LoRA.
+    """Load pretrained CausalWanModel_S2V, optionally expand to 49ch, apply LoRA.
+
+    Training modes:
+      training_mode="v2v": expand patch_embedding 16->49ch for V2V inpainting
+      training_mode="i2v": keep original 16ch (ref injected via sink conditioning)
 
     Supports loading the LiveAvatar DMD (distillation) LoRA checkpoint in two modes:
       merge_dmd_lora=True:  merge DMD into base weights, then apply fresh LoRA
@@ -126,18 +130,23 @@ def load_and_prepare_model(config, device):
         model = model.merge_and_unload()
         logger.info(f"DMD LoRA merged into base weights from {dmd_lora_path}")
 
-    # 3. Expand patch_embedding: 16 -> 49
-    old_conv = model.patch_embedding
-    dim = model.dim
-    patch_size = tuple(model.patch_size)
-    new_conv = nn.Conv3d(49, dim, kernel_size=patch_size, stride=patch_size)
-    with torch.no_grad():
-        new_conv.weight.zero_()
-        new_conv.weight[:, :16] = old_conv.weight
-        new_conv.bias.data.copy_(old_conv.bias.data)
-    model.patch_embedding = new_conv
-    model.in_dim = 49
-    logger.info("Expanded patch_embedding: 16 -> 49 channels")
+    # 3. Expand patch_embedding (V2V only): 16 -> 49
+    training_mode = config.get("training_mode", "v2v")
+    if training_mode == "v2v":
+        old_conv = model.patch_embedding
+        dim = model.dim
+        patch_size = tuple(model.patch_size)
+        new_conv = nn.Conv3d(49, dim, kernel_size=patch_size, stride=patch_size)
+        with torch.no_grad():
+            new_conv.weight.zero_()
+            new_conv.weight[:, :16] = old_conv.weight
+            new_conv.bias.data.copy_(old_conv.bias.data)
+        model.patch_embedding = new_conv
+        model.in_dim = 49
+        logger.info("Expanded patch_embedding: 16 -> 49 channels (V2V mode)")
+    else:
+        # I2V: keep original 16ch patch_embedding
+        logger.info("Keeping original 16ch patch_embedding (I2V mode)")
 
     # 4. Apply LoRA
     lora_targets = config.get("lora_targets", "q,k,v,o,ffn.0,ffn.2").split(",")
@@ -159,8 +168,11 @@ def load_and_prepare_model(config, device):
         logger.info(f"DMD LoRA weights loaded (continue-training mode): {loaded} params from {dmd_lora_path}")
 
     # 6. Unfreeze patch_embedding (PEFT freezes everything except LoRA)
-    for p in model.base_model.model.patch_embedding.parameters():
-        p.requires_grad = True
+    # V2V: the expanded 49ch patch_embedding needs training
+    # I2V: keep original 16ch frozen (pretrained weights are good)
+    if training_mode == "v2v":
+        for p in model.base_model.model.patch_embedding.parameters():
+            p.requires_grad = True
 
     # Count trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -342,6 +354,8 @@ def training_step(
     """
     use_precomputed = "x_0" in batch
     batch_size = batch["x_0"].shape[0] if use_precomputed else batch["video"].shape[0]
+    training_mode = config.get("training_mode", "v2v")
+    is_i2v = (training_mode == "i2v")
     num_blocks = 7
     latent_frames_per_block = 3
     motion_frames_video = 73
@@ -356,12 +370,19 @@ def training_step(
     if use_precomputed:
         # Full precomputed path — no VAE needed
         x_0 = batch["x_0"].to(device, dtype=torch.bfloat16)
-        masked_latents = batch["masked_latents"].to(device, dtype=torch.bfloat16)
-        ref_latents_49ch = batch["ref_latents_49ch"].to(device, dtype=torch.bfloat16)
         ref_latents_sink = batch["ref_latents_sink"].to(device, dtype=torch.bfloat16)
         motion_latents = batch["motion_latents"].to(device, dtype=torch.bfloat16)
-        mask_latent = batch["mask_latent"].to(device, dtype=torch.bfloat16)
-        mouth_mask = batch["mouth_mask"].to(device)
+        if is_i2v:
+            # I2V: no masked/ref_49ch/mask needed — ref goes through sink only
+            masked_latents = None
+            ref_latents_49ch = None
+            mask_latent = None
+            mouth_mask = None
+        else:
+            masked_latents = batch["masked_latents"].to(device, dtype=torch.bfloat16)
+            ref_latents_49ch = batch["ref_latents_49ch"].to(device, dtype=torch.bfloat16)
+            mask_latent = batch["mask_latent"].to(device, dtype=torch.bfloat16)
+            mouth_mask = batch["mouth_mask"].to(device)
     else:
         # Original path: VAE encode from raw video
         # Move VAE to GPU for encoding, then offload to free memory for backward pass
@@ -369,25 +390,19 @@ def training_step(
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             video = batch["video"].to(device)            # [B, 3, 81, H, W]
             ref_frames = batch["ref_frames"].to(device)  # [B, 3, 81, H, W]
-            mouth_mask = batch["mouth_mask"].to(device)  # [B, 1, H, W]
 
             # GT video -> latents (diffusion target)
             # 81 frames -> 21 latent frames (Tzip = 1 + 80/4 = 21). Train on all 21.
             x_0 = vae_encode_batch(vae, video)  # [B, 16, 21, H_lat, W_lat]
 
-            # Masked video -> latents (mouth zeroed in pixel space BEFORE encoding)
-            # mask.png convention: 1.0 = keep (upper face), 0.0 = inpaint (mouth/chin)
-            mask_pixel = mouth_mask.unsqueeze(2).expand(-1, -1, 81, -1, -1)
-            masked_video = video * mask_pixel
-            masked_latents = vae_encode_batch(vae, masked_video)  # [B, 16, 21, H_lat, W_lat]
-
-            # Reference -> latents for 49-ch input (per-block identity conditioning)
-            ref_latents_49ch = vae_encode_batch(vae, ref_frames)  # [B, 16, 21, H_lat, W_lat]
-
             # Reference -> single frame latent for _forward_sink (conditioning cache)
             # VAE CausalConv3d needs 5 frames for proper temporal context; [:,:,1:] selects
             # the second latent frame which has full causal context (matches pipeline line 902-903)
-            ref_single = ref_frames[:, :, 0:1, :, :]  # [B, 3, 1, H, W]
+            if is_i2v:
+                # I2V: ref = first frame of GT video (identity self-reconstruction)
+                ref_single = video[:, :, 0:1, :, :]  # [B, 3, 1, H, W]
+            else:
+                ref_single = ref_frames[:, :, 0:1, :, :]  # [B, 3, 1, H, W]
             ref_5frames = ref_single.repeat(1, 1, 5, 1, 1)  # [B, 3, 5, H, W]
             ref_latents_sink = vae_encode_batch(vae, ref_5frames)[:, :, 1:]  # [B, 16, 1, H_lat, W_lat]
 
@@ -398,14 +413,33 @@ def training_step(
             motion_pixel = ref_single.repeat(1, 1, motion_frames_video, 1, 1)
             motion_latents = vae_encode_batch(vae, motion_pixel)  # [B, 16, 19, H_lat, W_lat]
 
-            # Mask -> latent space (trilinear interpolation)
-            mask_for_latent = mask_pixel.float()
-            mask_latent = F.interpolate(
-                mask_for_latent, size=(21, H_lat, W_lat), mode="trilinear", align_corners=False
-            )  # [B, 1, 21, H_lat, W_lat]
+            if is_i2v:
+                # I2V: no masked video, ref_49ch, or mask needed
+                masked_latents = None
+                ref_latents_49ch = None
+                mask_latent = None
+                mouth_mask = None
+            else:
+                mouth_mask = batch["mouth_mask"].to(device)  # [B, 1, H, W]
+                # Masked video -> latents (mouth zeroed in pixel space BEFORE encoding)
+                # mask.png convention: 1.0 = keep (upper face), 0.0 = inpaint (mouth/chin)
+                mask_pixel = mouth_mask.unsqueeze(2).expand(-1, -1, 81, -1, -1)
+                masked_video = video * mask_pixel
+                masked_latents = vae_encode_batch(vae, masked_video)  # [B, 16, 21, H_lat, W_lat]
+
+                # Reference -> latents for 49-ch input (per-block identity conditioning)
+                ref_latents_49ch = vae_encode_batch(vae, ref_frames)  # [B, 16, 21, H_lat, W_lat]
+
+                # Mask -> latent space (trilinear interpolation)
+                mask_for_latent = mask_pixel.float()
+                mask_latent = F.interpolate(
+                    mask_for_latent, size=(21, H_lat, W_lat), mode="trilinear", align_corners=False
+                )  # [B, 1, 21, H_lat, W_lat]
 
         # Free pixel-space tensors and offload VAE to CPU
-        del video, ref_frames, masked_video, mask_pixel, ref_5frames, motion_pixel
+        del video, ref_frames, ref_5frames, motion_pixel
+        if not is_i2v:
+            del masked_video, mask_pixel
         move_vae(vae, "cpu")
         torch.cuda.empty_cache()
 
@@ -499,11 +533,12 @@ def training_step(
 
     # ── STEP 4: Noise + target (restricted 4-step) ────────────────────────
     x_0 = x_0.to(device, dtype=torch.bfloat16)
-    masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
-    ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
     ref_latents_sink = ref_latents_sink.to(device, dtype=torch.bfloat16)
     motion_latents = motion_latents.to(device, dtype=torch.bfloat16)
-    mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
+    if not is_i2v:
+        masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
+        ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
+        mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
 
     choice = torch.randint(0, len(restricted_timesteps), (batch_size,), device=device)
     sigma = restricted_sigmas[choice].to(device).view(batch_size, 1, 1, 1, 1).to(torch.bfloat16)
@@ -514,7 +549,10 @@ def training_step(
     velocity_target = noise - x_0  # [B, 16, 21, H_lat, W_lat]
 
     # ── STEP 5: Prepare padding + caches ──────────────────────────────────
-    ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)  # [B, 49, 1, H_lat, W_lat]
+    if is_i2v:
+        ref_latents_padded = ref_latents_sink  # [B, 16, 1, H_lat, W_lat] — direct 16ch
+    else:
+        ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)  # [B, 49, 1, H_lat, W_lat]
     # patch_size=(1,2,2) spatial downsampling: each latent frame -> (H_lat/2)*(W_lat/2) tokens
     frame_seq_length = (H_lat // 2) * (W_lat // 2)
 
@@ -573,21 +611,25 @@ def training_step(
 
             # Slice per-block tensors
             x_t_block = x_t[:, :, block_start_frame:block_end_frame]
-            mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
-            masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
-            ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
 
             # Audio for this block: 12 video frames per block
             audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
 
-            # Build 49-channel input
-            x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+            if is_i2v:
+                # I2V: noise-only 16ch input
+                x_input = x_t_block
+            else:
+                # V2V: build 49-channel input
+                mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
+                masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
+                ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
+                x_input = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
 
             # Timestep: [B, 3] same value across all frames in block
             t_block = timestep_val.unsqueeze(1).expand(batch_size, latent_frames_per_block).float()
 
             # Convert to per-sample list (LiveAvatar convention)
-            x_list = [x_49[b] for b in range(batch_size)]
+            x_list = [x_input[b] for b in range(batch_size)]
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 velocity_list = base_model._forward_inference(
@@ -619,17 +661,24 @@ def training_step(
 
     # Compute reference loss from Phase 1 predictions (for validation)
     v_output_ref = torch.cat(v_cache, dim=2)  # [B, 16, 21, H_lat, W_lat]
-    # mask_latent: 1=keep (upper face), 0=inpaint (mouth). Invert so mouth gets upweighted.
-    mouth_indicator = 1.0 - mask_latent.float()
-    full_weight_ref = 1.0 + (W_mouth - 1.0) * mouth_indicator
-    loss_ref = (
-        F.mse_loss(v_output_ref.float(), velocity_target.float(), reduction="none")
-        * full_weight_ref
-    ).mean()
+    if is_i2v:
+        # I2V: uniform MSE (no mouth mask weighting)
+        loss_ref = F.mse_loss(v_output_ref.float(), velocity_target.float())
+    else:
+        # V2V: mouth-weighted MSE
+        # mask_latent: 1=keep (upper face), 0=inpaint (mouth). Invert so mouth gets upweighted.
+        mouth_indicator = 1.0 - mask_latent.float()
+        full_weight_ref = 1.0 + (W_mouth - 1.0) * mouth_indicator
+        loss_ref = (
+            F.mse_loss(v_output_ref.float(), velocity_target.float(), reduction="none")
+            * full_weight_ref
+        ).mean()
     if timestep_weights is not None:
         loss_ref = loss_ref * timestep_weights[choice].mean()
     loss_ref_val = loss_ref.item()
-    del v_output_ref, full_weight_ref, loss_ref
+    del v_output_ref, loss_ref
+    if not is_i2v:
+        del full_weight_ref
 
     # ──── Phase 2: Reverse per-block backward (gradient accumulation) ─
     # Re-run each block WITH grad in reverse order (6→0), compute loss,
@@ -644,14 +693,18 @@ def training_step(
 
         # Slice per-block tensors (same as Phase 1)
         x_t_block = x_t[:, :, block_start_frame:block_end_frame]
-        mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
-        masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
-        ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
         audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
 
-        x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+        if is_i2v:
+            x_input = x_t_block
+        else:
+            mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
+            masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
+            ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
+            x_input = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+
         t_block = timestep_val.unsqueeze(1).expand(batch_size, latent_frames_per_block).float()
-        x_list = [x_49[b] for b in range(batch_size)]
+        x_list = [x_input[b] for b in range(batch_size)]
 
         # Re-run this single block WITH gradients
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -682,14 +735,18 @@ def training_step(
                 full_predictions.append(v_cache[j])
         velocity_output = torch.cat(full_predictions, dim=2)  # [B, 16, 21, H_lat, W_lat]
 
-        # Mouth-weighted MSE loss: upweight the inpaint region (mouth/chin)
-        # mask_latent: 1=keep (upper face), 0=inpaint (mouth). Invert so mouth gets W_mouth weight.
-        mouth_indicator = 1.0 - mask_latent.float()
-        full_weight = 1.0 + (W_mouth - 1.0) * mouth_indicator
-        loss_elem = F.mse_loss(
-            velocity_output.float(), velocity_target.float(), reduction="none"
-        )
-        loss = (loss_elem * full_weight).mean()
+        if is_i2v:
+            # I2V: uniform MSE loss
+            loss = F.mse_loss(velocity_output.float(), velocity_target.float())
+        else:
+            # V2V: mouth-weighted MSE loss
+            # mask_latent: 1=keep (upper face), 0=inpaint (mouth). Invert so mouth gets W_mouth weight.
+            mouth_indicator = 1.0 - mask_latent.float()
+            full_weight = 1.0 + (W_mouth - 1.0) * mouth_indicator
+            loss_elem = F.mse_loss(
+                velocity_output.float(), velocity_target.float(), reduction="none"
+            )
+            loss = (loss_elem * full_weight).mean()
         if timestep_weights is not None:
             loss = loss * timestep_weights[choice].mean()
 
@@ -710,7 +767,9 @@ def training_step(
         if hasattr(base_model, 'audio_emb_global') and base_model.audio_emb_global is not None:
             base_model.audio_emb_global = base_model.audio_emb_global.detach()
 
-        del velocity_pred_grad, velocity_output, loss, loss_elem, full_weight, full_predictions
+        del velocity_pred_grad, velocity_output, loss, full_predictions
+        if not is_i2v:
+            del loss_elem, full_weight
         torch.cuda.empty_cache()
 
     # # KV cache diagnostics
@@ -877,6 +936,8 @@ def validate(
         mode: "recon" (same video/audio) or "mixed" (different audio source)
         max_samples: Maximum number of validation samples to generate
     """
+    training_mode = config.get("training_mode", "v2v")
+    is_i2v = (training_mode == "i2v")
     num_blocks = 7
     latent_frames_per_block = 3
     motion_frames_video = 73
@@ -946,16 +1007,6 @@ def validate(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 video = batch["video"].to(device)           # [1, 3, 81, H, W]
                 ref_frames = batch["ref_frames"].to(device) # [1, 3, 81, H, W]
-                mouth_mask = batch["mouth_mask"].to(device)  # [1, 1, H, W]
-
-                # Masked video (mouth zeroed)
-                # mask.png convention: 1.0 = keep (upper face), 0.0 = inpaint (mouth/chin)
-                mask_pixel = mouth_mask.unsqueeze(2).expand(-1, -1, 81, -1, -1)
-                masked_video = video * mask_pixel
-                masked_latents = vae_encode_batch(vae, masked_video)
-
-                # Reference latents for 49ch
-                ref_latents_49ch = vae_encode_batch(vae, ref_frames)
 
                 # Reference latent for sink (single frame with temporal context)
                 ref_single = ref_frames[:, :, 0:1, :, :]
@@ -966,14 +1017,31 @@ def validate(
                 motion_pixel = ref_single.repeat(1, 1, motion_frames_video, 1, 1)
                 motion_latents = vae_encode_batch(vae, motion_pixel)
 
-                # Mask in latent space
-                mask_for_latent = mask_pixel.float()
-                mask_latent = F.interpolate(
-                    mask_for_latent, size=(num_latent_frames, H_lat, W_lat),
-                    mode="trilinear", align_corners=False,
-                )
+                if is_i2v:
+                    # I2V: no masked video, ref_49ch, or mask needed
+                    masked_latents = None
+                    ref_latents_49ch = None
+                    mask_latent = None
+                else:
+                    mouth_mask = batch["mouth_mask"].to(device)  # [1, 1, H, W]
+                    # Masked video (mouth zeroed)
+                    mask_pixel = mouth_mask.unsqueeze(2).expand(-1, -1, 81, -1, -1)
+                    masked_video = video * mask_pixel
+                    masked_latents = vae_encode_batch(vae, masked_video)
 
-            del masked_video, mask_pixel, ref_5frames, motion_pixel
+                    # Reference latents for 49ch
+                    ref_latents_49ch = vae_encode_batch(vae, ref_frames)
+
+                    # Mask in latent space
+                    mask_for_latent = mask_pixel.float()
+                    mask_latent = F.interpolate(
+                        mask_for_latent, size=(num_latent_frames, H_lat, W_lat),
+                        mode="trilinear", align_corners=False,
+                    )
+
+            del ref_5frames, motion_pixel
+            if not is_i2v:
+                del masked_video, mask_pixel
             move_vae(vae, "cpu")
             torch.cuda.empty_cache()
 
@@ -1001,13 +1069,16 @@ def validate(
             torch.cuda.empty_cache()
 
             # ── Prepare tensors ───────────────────────────────────────────
-            masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
-            ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
             ref_latents_sink = ref_latents_sink.to(device, dtype=torch.bfloat16)
             motion_latents = motion_latents.to(device, dtype=torch.bfloat16)
-            mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
 
-            ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)
+            if is_i2v:
+                ref_latents_padded = ref_latents_sink  # 16ch direct
+            else:
+                masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
+                ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
+                mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
+                ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)
             zeros_cond = torch.zeros(1, 16, latent_frames_per_block, H_lat, W_lat,
                                      device=device, dtype=torch.bfloat16)
 
@@ -1062,10 +1133,11 @@ def validate(
                 block_end = (block_idx + 1) * latent_frames_per_block
 
                 # Fixed conditioning for this block (doesn't change across timesteps)
-                mask_block = mask_latent[:, :, block_start:block_end]
-                masked_block = masked_latents[:, :, block_start:block_end]
-                ref_block = ref_latents_49ch[:, :, block_start:block_end]
                 audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
+                if not is_i2v:
+                    mask_block = mask_latent[:, :, block_start:block_end]
+                    masked_block = masked_latents[:, :, block_start:block_end]
+                    ref_block = ref_latents_49ch[:, :, block_start:block_end]
 
                 # Start from noise for this block
                 block_latents = x_t[:, :, block_start:block_end]  # [1, 16, 3, H, W]
@@ -1081,14 +1153,17 @@ def validate(
                     if offload_kv_cache:
                         move_kv_cache_to_device(kv_caches[cache_key], device)
 
-                    # Construct 49ch input with current noisy block latents
-                    x_49 = construct_49ch_block(block_latents, mask_block, masked_block, ref_block)
+                    if is_i2v:
+                        x_input = block_latents  # 16ch noise only
+                    else:
+                        # Construct 49ch input with current noisy block latents
+                        x_input = construct_49ch_block(block_latents, mask_block, masked_block, ref_block)
 
                     # Timestep tensor: [1, 3]
                     t_block = torch.tensor([t_val] * latent_frames_per_block,
                                            device=device).unsqueeze(0).float()
 
-                    x_list = [x_49[0]]  # Per-sample list (batch=1)
+                    x_list = [x_input[0]]  # Per-sample list (batch=1)
 
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         velocity_list = base_model._forward_inference(
@@ -1184,8 +1259,9 @@ def validate(
 
             # Free per-sample tensors
             del kv_caches, crossattn_cache, output_latents, x_t, decoded
-            del masked_latents, ref_latents_49ch, ref_latents_sink, motion_latents
-            del mask_latent, audio_emb, context
+            del ref_latents_sink, motion_latents, audio_emb, context
+            if not is_i2v:
+                del masked_latents, ref_latents_49ch, mask_latent
             torch.cuda.empty_cache()
 
         except Exception as e:
@@ -1350,13 +1426,14 @@ def main():
     # ── Dataset + DataLoader ──────────────────────────────────────────────
     from lipsync_dataset import LipSyncDataset, ValLipSyncDataset, PrecomputedLipSyncDataset, lipsync_collate_fn
 
+    training_mode = config.get("training_mode", "v2v")
     if use_precomputed:
         precomputed_csv = config.get("precomputed_csv")
         if not precomputed_csv:
             raise ValueError("use_precomputed=true but precomputed_csv not set in config")
         dataset = PrecomputedLipSyncDataset(
             precomputed_csv=precomputed_csv,
-            mask_path=config["mask_path"],
+            mask_path=config.get("mask_path"),
             height=config.get("height", 512),
             width=config.get("width", 512),
         )
@@ -1369,7 +1446,8 @@ def main():
             height=config.get("height", 512),
             width=config.get("width", 512),
             num_frames=config.get("num_frames", 81),
-            mask_path=config["mask_path"],
+            mask_path=config.get("mask_path"),
+            training_mode=training_mode,
         )
 
     dataloader = DataLoader(
@@ -1390,7 +1468,8 @@ def main():
         height=config.get("height", 512),
         width=config.get("width", 512),
         num_frames=config.get("num_frames", 81),
-        mask_path=config["mask_path"],
+        mask_path=config.get("mask_path"),
+        training_mode=training_mode,
     )
     if config.get("val_recon_csv"):
         val_recon_dataset = ValLipSyncDataset(

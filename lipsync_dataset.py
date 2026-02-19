@@ -1,6 +1,6 @@
 """
 Minimal LipSync dataset for LiveAvatar training.
-Loads video clips, reference frames, and mouth masks for 49-channel input construction.
+Loads video clips, reference frames, and mouth masks for V2V (49-channel) or I2V (16-channel) training.
 """
 
 import hashlib
@@ -38,6 +38,7 @@ class LipSyncDataset(Dataset):
         width=512,
         num_frames=81,
         mask_path=None,
+        training_mode="v2v",
     ):
         """
         Args:
@@ -46,10 +47,12 @@ class LipSyncDataset(Dataset):
             height: Target spatial height.
             width: Target spatial width.
             num_frames: Number of video frames per clip (must be 81 for Wan VAE stride 4).
-            mask_path: Path to a precomputed mask image (H×W, white=mouth). Required.
+            mask_path: Path to a precomputed mask image (H×W, white=mouth). Required for V2V.
+            training_mode: "v2v" or "i2v". I2V does not require mask_path.
         """
-        if mask_path is None:
-            raise ValueError("mask_path is required — provide a precomputed mouth mask image")
+        self.training_mode = training_mode
+        if mask_path is None and training_mode == "v2v":
+            raise ValueError("mask_path is required for V2V mode — provide a precomputed mouth mask image")
 
         self.height = height
         self.width = width
@@ -70,11 +73,14 @@ class LipSyncDataset(Dataset):
 
         assert len(self.video_paths) > 0, f"No videos found in {data_root}"
 
-        # Precompute mouth mask [1, H, W] float
-        mask_img = Image.open(mask_path).convert("L").resize(
-            (width, height), Image.NEAREST
-        )
-        self.mouth_mask = (torch.from_numpy(np.array(mask_img)).float() / 255.0).unsqueeze(0)
+        # Precompute mouth mask [1, H, W] float (V2V only)
+        if mask_path is not None:
+            mask_img = Image.open(mask_path).convert("L").resize(
+                (width, height), Image.NEAREST
+            )
+            self.mouth_mask = (torch.from_numpy(np.array(mask_img)).float() / 255.0).unsqueeze(0)
+        else:
+            self.mouth_mask = None
 
     def __len__(self):
         return len(self.video_paths)
@@ -100,35 +106,44 @@ class LipSyncDataset(Dataset):
         gt_indices = list(range(gt_start, gt_start + self.num_frames))
         gt = self._load_frames(vr, gt_indices)  # [3, 81, H, W]
 
-        # Reference segment: different part of video for identity conditioning
-        if total >= 2 * self.num_frames:
-            # Enough frames for non-overlapping ref
-            remaining_starts = []
-            if gt_start >= self.num_frames:
-                remaining_starts.append(random.randint(0, gt_start - self.num_frames))
-            if gt_start + self.num_frames + self.num_frames <= total:
-                remaining_starts.append(
-                    random.randint(gt_start + self.num_frames, total - self.num_frames)
-                )
-            if remaining_starts:
-                ref_start = random.choice(remaining_starts)
-            else:
-                ref_start = random.randint(0, max(0, total - self.num_frames))
+        # Reference segment
+        if self.training_mode == "i2v":
+            # I2V: ref = first frame of GT (repeated). Actual ref used in training_step
+            # is the first frame of GT video latents, but we still need ref_frames for
+            # compatibility with the data pipeline.
+            ref = self._load_frames(vr, [0] * self.num_frames)  # [3, 81, H, W]
         else:
-            # Short video: ref can overlap with GT (still useful — different noise/augment)
-            ref_start = random.randint(0, max(0, total - self.num_frames))
+            # V2V: different part of video for identity conditioning
+            if total >= 2 * self.num_frames:
+                # Enough frames for non-overlapping ref
+                remaining_starts = []
+                if gt_start >= self.num_frames:
+                    remaining_starts.append(random.randint(0, gt_start - self.num_frames))
+                if gt_start + self.num_frames + self.num_frames <= total:
+                    remaining_starts.append(
+                        random.randint(gt_start + self.num_frames, total - self.num_frames)
+                    )
+                if remaining_starts:
+                    ref_start = random.choice(remaining_starts)
+                else:
+                    ref_start = random.randint(0, max(0, total - self.num_frames))
+            else:
+                # Short video: ref can overlap with GT (still useful — different noise/augment)
+                ref_start = random.randint(0, max(0, total - self.num_frames))
 
-        ref_indices = list(range(ref_start, ref_start + self.num_frames))
-        ref = self._load_frames(vr, ref_indices)  # [3, 81, H, W]
+            ref_indices = list(range(ref_start, ref_start + self.num_frames))
+            ref = self._load_frames(vr, ref_indices)  # [3, 81, H, W]
 
-        return {
+        result = {
             "video": gt,                       # [3, 81, H, W] float [-1, 1]
             "ref_frames": ref,                 # [3, 81, H, W] float [-1, 1]
-            "mouth_mask": self.mouth_mask,     # [1, H, W] binary float
             "audio_path": video_path,          # str — wav2vec2 extracts audio from mp4
             "video_path": video_path,          # str — for logging
             "text": self.prompts[idx] if self.prompts is not None else "A person speaking",
         }
+        if self.mouth_mask is not None:
+            result["mouth_mask"] = self.mouth_mask  # [1, H, W] binary float
+        return result
 
     def _load_frames(self, vr, indices):
         """Load, resize, and normalize frames from decord VideoReader.
@@ -164,9 +179,10 @@ class ValLipSyncDataset(Dataset):
         width=512,
         num_frames=81,
         mask_path=None,
+        training_mode="v2v",
     ):
-        if mask_path is None:
-            raise ValueError("mask_path is required")
+        if mask_path is None and training_mode == "v2v":
+            raise ValueError("mask_path is required for V2V mode")
         if metadata_csv is None:
             raise ValueError("metadata_csv is required for validation dataset")
 
@@ -191,11 +207,14 @@ class ValLipSyncDataset(Dataset):
 
         assert len(self.video_paths) > 0, f"No videos found in {metadata_csv}"
 
-        # Precompute mouth mask [1, H, W] float
-        mask_img = Image.open(mask_path).convert("L").resize(
-            (width, height), Image.NEAREST
-        )
-        self.mouth_mask = (torch.from_numpy(np.array(mask_img)).float() / 255.0).unsqueeze(0)
+        # Precompute mouth mask [1, H, W] float (V2V only)
+        if mask_path is not None:
+            mask_img = Image.open(mask_path).convert("L").resize(
+                (width, height), Image.NEAREST
+            )
+            self.mouth_mask = (torch.from_numpy(np.array(mask_img)).float() / 255.0).unsqueeze(0)
+        else:
+            self.mouth_mask = None
 
     def __len__(self):
         return len(self.video_paths)
@@ -226,16 +245,18 @@ class ValLipSyncDataset(Dataset):
         video_id = os.path.splitext(os.path.basename(video_path))[0]
         audio_id = os.path.splitext(os.path.basename(audio_path))[0]
 
-        return {
+        result = {
             "video": gt,
             "ref_frames": ref,
-            "mouth_mask": self.mouth_mask,
             "audio_path": audio_path,
             "video_path": video_path,
             "video_id": video_id,
             "audio_id": audio_id,
             "text": self.prompts[idx] if self.prompts is not None else "A person speaking",
         }
+        if self.mouth_mask is not None:
+            result["mouth_mask"] = self.mouth_mask
+        return result
 
     def _load_frames(self, vr, indices):
         """Load, resize, and normalize frames. Returns: [3, N, H, W] in [-1, 1]"""

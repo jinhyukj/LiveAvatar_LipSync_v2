@@ -5,10 +5,17 @@ import numpy as np
 from shutil import rmtree
 import torch
 
-from scenedetect.video_manager import VideoManager
-from scenedetect.scene_manager import SceneManager
-from scenedetect.stats_manager import StatsManager
-from scenedetect.detectors import ContentDetector
+try:
+    # Modern scenedetect API (v0.6+)
+    from scenedetect import open_video, SceneManager, ContentDetector
+    _USE_MODERN_API = True
+except ImportError:
+    # Legacy scenedetect API (deprecated, may show interactive prompts)
+    from scenedetect.video_manager import VideoManager
+    from scenedetect.scene_manager import SceneManager
+    from scenedetect.stats_manager import StatsManager
+    from scenedetect.detectors import ContentDetector
+    _USE_MODERN_API = False
 
 from scipy.interpolate import interp1d
 from scipy.io import wavfile
@@ -97,24 +104,30 @@ class SyncNetDetector:
         rmtree(temp_dir)
 
     def scene_detect(self, video_dir):
-        video_manager = VideoManager([os.path.join(video_dir, "video.mp4")])
+        video_path = os.path.join(video_dir, "video.mp4")
+
+        if _USE_MODERN_API:
+            video = open_video(video_path)
+            scene_manager = SceneManager()
+            scene_manager.add_detector(ContentDetector())
+            scene_manager.detect_scenes(video)
+            scene_list = scene_manager.get_scene_list()
+            if not scene_list:
+                scene_list = [(video.base_timecode, video.duration)]
+            return scene_list
+
+        # Legacy API fallback
+        video_manager = VideoManager([video_path])
         stats_manager = StatsManager()
         scene_manager = SceneManager(stats_manager)
-        # Add ContentDetector algorithm (constructor takes detector options like threshold).
         scene_manager.add_detector(ContentDetector())
         base_timecode = video_manager.get_base_timecode()
-
         video_manager.set_downscale_factor()
-
         video_manager.start()
-
         scene_manager.detect_scenes(frame_source=video_manager)
-
         scene_list = scene_manager.get_scene_list(base_timecode)
-
         if scene_list == []:
             scene_list = [(video_manager.get_base_timecode(), video_manager.get_current_timecode())]
-
         return scene_list
 
     def track_face(self, scenefaces, num_failed_det=25, min_track=50, min_face_size=100):
